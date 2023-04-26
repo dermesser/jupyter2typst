@@ -2,10 +2,14 @@ use markdown::mdast::Node;
 use rustop::opts;
 use tinyjson::JsonValue;
 
-use std::collections::HashMap;
+use std::collections::{
+    hash_map::{Entry, OccupiedEntry},
+    HashMap,
+};
 use std::error::Error;
 use std::fmt::{self, Write};
 use std::io;
+use std::ops::Deref;
 use std::{fs, path::Path};
 
 struct Context {
@@ -56,6 +60,15 @@ const document_root: &str = r###"
                   radius: 3pt,
                   width: 100%,
                   raw(code, lang: lang))
+#let resultblock(bgcolor: white, stroke: 1pt + luma(150), content) = [
+    #move(
+        align(
+            right, box(
+                inset: 0pt, height: 0pt, 
+                text(size: 10pt, fill: luma(140))[_Result:_])),
+            dx: -4em, dy: 12pt)
+    #block(fill: bgcolor, outset: 5pt, radius: 3pt, width: 100%, stroke: stroke, raw(content))
+]
 
 
 "###;
@@ -173,6 +186,68 @@ fn convert_markdown_to_typst(s: &str) -> Result<String, J2TError> {
     Ok(s)
 }
 
+fn format_cell_result(
+    ctx: &Context,
+    cell: &HashMap<String, JsonValue>,
+) -> Result<String, J2TError> {
+    let content = Vec::<JsonValue>::try_from(cell["outputs"].clone())?;
+
+    let get_type = |output: &JsonValue| {
+        let o =
+            HashMap::<String, JsonValue>::try_from(output.clone()).expect("output object in cell");
+        (
+            o.get("output_type")
+                .map(|oo| String::try_from(oo.clone()).expect("output type is string"))
+                .clone(),
+            o.get("text").map(|e| e.clone()),
+            o.get("data").map(|e| e.clone()),
+        )
+    };
+    let kinds = content.iter().map(get_type).collect::<Vec<_>>();
+
+    // Prefer execute_result - text/plain. Then use stream / stderr.
+    let execute_result_str = "execute_result".to_string();
+    let stream_str = "stream".to_string();
+
+    // Weird ordering: we want to prefer `execute_result` over `stream`.
+    for result_type in &[execute_result_str, stream_str] {
+        for k in kinds.iter() {
+            if k.0.as_ref() == Some(result_type) {
+                // Type `data`
+                if let Some(ref data_obj) = k.2 {
+                    let data = HashMap::<_, _>::try_from(data_obj.clone())
+                        .expect("jsonvalue to hashmap failed for parsing cell output data");
+                    if let Some(e) = data.get("text/plain") {
+                        return Ok(strip_ansi_codes(join_json_lines_array(e.clone())));
+                    } // To do: other MIME types such as text/html and text/latex might typically be
+                      // available.
+                }
+
+                // Type `stream`
+                if let Some(ref text) = k.1 {
+                    return Ok(strip_ansi_codes(join_json_lines_array(text.clone())));
+                }
+            }
+        }
+    }
+
+    Ok(String::new())
+}
+
+fn strip_ansi_codes(s: String) -> String {
+    // TODO: implement this functionality.
+    s
+}
+
+fn join_json_lines_array(lines: JsonValue) -> String {
+    Vec::<_>::try_from(lines)
+        .expect("could not convert string array to vec of json values")
+        .into_iter()
+        .map(|s| <JsonValue as TryInto<String>>::try_into(s).unwrap())
+        .collect::<Vec<String>>()
+        .join("")
+}
+
 fn format_cell(ctx: &Context, cell: &JsonValue) -> Result<String, J2TError> {
     let hm: HashMap<_, _> = cell.clone().try_into()?;
     let cell_type = String::try_from(hm["cell_type"].clone()).expect("string from cell_type");
@@ -187,22 +262,28 @@ fn format_cell(ctx: &Context, cell: &JsonValue) -> Result<String, J2TError> {
         convert_markdown_to_typst(&joined)
     } else if cell_type == "code" {
         let exec_count = f64::try_from(hm["execution_count"].clone()).unwrap();
-        let joined: String =
+        let joined_code: String =
             <Vec<JsonValue> as TryFrom<JsonValue>>::try_from(hm["source"].clone())?
                 .into_iter()
                 .map(|s| <JsonValue as TryInto<String>>::try_into(s).unwrap())
                 .collect::<Vec<String>>()
                 .join("");
         assert!(
-            !joined.contains('`'),
+            !joined_code.contains('`'),
             "Currently, code is not allowed to contain backticks!"
         );
-        Ok(format!(
+        let result_joined = format_cell_result(ctx, &hm)?;
+        let code_content = format!(
             r#"
 #move(align(right, box(text([[{}]], fill: blue), fill: red, inset: 0pt, height: 0pt)), dx: -25pt, dy: 10pt)
-#codeblock(lang: "{}", `{}`.text)"#,
-            exec_count, ctx.lang, joined
-        ))
+#codeblock(lang: "{}", `{}`.text)
+#resultblock(`{}`.text)
+
+"#,
+            exec_count, ctx.lang, joined_code, result_joined
+        );
+
+        Ok(code_content)
     } else {
         Ok(String::new())
     }
@@ -242,19 +323,14 @@ fn main() {
         .expect("open output file");
     use std::io::Write;
     outfile.write(document_root.as_bytes());
-    write!(
-        outfile,
-        "{}",
-        format_cell(&ctx, &cells[0]).expect("format failed")
-    );
-    write!(
-        outfile,
-        "{}",
-        format_cell(&ctx, &cells[1]).expect("format failed")
-    );
-    write!(
-        outfile,
-        "{}",
-        format_cell(&ctx, &cells[cells.len() - 1]).expect("format failed")
-    );
+
+    let ixs = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, cells.len() - 1];
+
+    for i in ixs {
+        write!(
+            outfile,
+            "{}",
+            format_cell(&ctx, &cells[i]).expect("format failed")
+        );
+    }
 }
